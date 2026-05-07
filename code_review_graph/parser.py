@@ -88,6 +88,7 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".c": "c",
     ".h": "c",
     ".hpp": "cpp",
+    ".hh": "cpp",
     ".kt": "kotlin",
     ".swift": "swift",
     ".php": "php",
@@ -130,6 +131,7 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".svh": "verilog",
     ".v": "verilog",
     ".vh": "verilog",
+    ".nix": "nix",
 }
 
 # Tree-sitter node type mappings per language
@@ -174,6 +176,9 @@ _CLASS_TYPES: dict[str, list[str]] = {
     # identifier is literally "defmodule". Dispatched via
     # _extract_elixir_constructs to avoid matching every ``call`` here.
     "elixir": [],
+    # Nix: attrset bindings aren't "classes"; dispatched via
+    # _extract_nix_constructs.
+    "nix": [],
     "zig": ["container_declaration"],
     "powershell": ["class_statement"],
     "julia": ["struct_definition", "abstract_definition"],
@@ -222,6 +227,9 @@ _FUNCTION_TYPES: dict[str, list[str]] = {
     # Elixir: def/defp/defmacro are all ``call`` nodes whose first
     # identifier matches. Dispatched via _extract_elixir_constructs.
     "elixir": [],
+    # Nix: `attrpath = expr;` bindings become Function nodes —
+    # handled in _extract_nix_constructs.
+    "nix": [],
     "zig": ["fn_proto", "fn_decl"],
     "powershell": ["function_statement"],
     "julia": [
@@ -263,6 +271,10 @@ _IMPORT_TYPES: dict[str, list[str]] = {
     # Elixir: alias/import/require/use are all ``call`` nodes —
     # handled in _extract_elixir_constructs.
     "elixir": [],
+    # Nix: `import ./x.nix`, `callPackage ./y.nix {}`, and flake
+    # `inputs.*.url` strings become IMPORTS_FROM edges —
+    # handled in _extract_nix_constructs.
+    "nix": [],
     # Zig: @import("...") is a builtin_call_expr — handled
     # generically via call types below.
     "zig": [],
@@ -305,6 +317,9 @@ _CALL_TYPES: dict[str, list[str]] = {
     # _extract_elixir_constructs which filters out def/defmodule/alias/etc.
     # before treating what's left as a real call.
     "elixir": [],
+    # Nix: function application is ubiquitous; only import/callPackage
+    # produce edges, in _extract_nix_constructs.
+    "nix": [],
     "zig": ["call_expression", "builtin_call_expr"],
     "powershell": ["command_expression"],
     "julia": ["call_expression"],
@@ -330,6 +345,7 @@ _TEST_FILE_PATTERNS = [
     re.compile(r".*\.spec\.[jt]sx?$"),
     re.compile(r".*_test\.go$"),
     re.compile(r"tests?/"),
+    re.compile(r"[\\/]__tests__[\\/]"),
     re.compile(r".*_test\.dart$"),
     re.compile(r"test[_-].*\.[rR]$"),
     re.compile(r"tests/testthat/"),
@@ -342,12 +358,61 @@ _TEST_FILE_PATTERNS = [
 _TEST_RUNNER_NAMES = frozenset({
     "describe", "it", "test", "beforeEach", "afterEach",
     "beforeAll", "afterAll",
+    # Mocha TDD interface: `suite` is the describe-equivalent.
+    # `test`, the it-equivalent, is already covered above.
+    "suite",
 })
 
 # Annotations/decorators that mark test methods (JUnit, TestNG, etc.)
 _TEST_ANNOTATIONS = frozenset({
     "Test", "ParameterizedTest", "RepeatedTest", "TestFactory",
     "org.junit.Test", "org.junit.jupiter.api.Test",
+})
+
+# Spring stereotype annotations that mark classes as managed beans
+_SPRING_STEREOTYPE_ANNOTATIONS = frozenset({
+    "Component", "Service", "Repository", "Controller", "RestController",
+    "Configuration", "Indexed", "ControllerAdvice", "RestControllerAdvice",
+    "EventListener",
+})
+
+# Spring DI injection annotations (field/setter/constructor-level)
+_SPRING_INJECT_ANNOTATIONS = frozenset({
+    "Autowired", "Inject", "Resource",
+})
+
+# Lombok annotations that trigger constructor injection of final fields
+_LOMBOK_CONSTRUCTOR_ANNOTATIONS = frozenset({
+    "RequiredArgsConstructor", "AllArgsConstructor",
+})
+
+# Temporal workflow/activity interface markers
+_TEMPORAL_INTERFACE_ANNOTATIONS = frozenset({
+    "WorkflowInterface", "ActivityInterface",
+})
+
+# Temporal method-level markers
+_TEMPORAL_METHOD_ANNOTATIONS = frozenset({
+    "WorkflowMethod", "ActivityMethod", "SignalMethod", "QueryMethod",
+})
+
+# Kafka consumer annotations (annotation-based pattern)
+_KAFKA_LISTENER_ANNOTATIONS = frozenset({"KafkaListener", "KafkaHandler"})
+
+# Kafka consumer field types (reactive / imperative)
+_KAFKA_CONSUMER_TYPES = frozenset({
+    "KafkaReceiver",
+    "ReactiveKafkaConsumerTemplate",
+    "MessageListenerContainer",
+    "ConcurrentMessageListenerContainer",
+})
+
+# Kafka producer field types
+_KAFKA_PRODUCER_TYPES = frozenset({
+    "KafkaTemplate",
+    "KafkaOperations",
+    "ReactiveKafkaProducerTemplate",
+    "KafkaSender",
 })
 
 
@@ -1808,6 +1873,20 @@ class CodeParser:
                 ):
                     continue
 
+            # --- Nix-specific constructs ---
+            # Nix bindings (``attrpath = expr;``) are the graph's addressable
+            # things; dispatch via _extract_nix_constructs to flatten dotted
+            # attrpaths into Function nodes and to emit IMPORTS_FROM edges for
+            # flake ``inputs.*.url`` strings and ``import``/``callPackage``
+            # applications. See: #366 follow-up (flake-aware Nix support).
+            if language == "nix" and node_type == "binding":
+                if self._extract_nix_constructs(
+                    child, source, language, file_path, nodes, edges,
+                    enclosing_class, enclosing_func,
+                    import_map, defined_names, _depth,
+                ):
+                    continue
+
             # --- Dart call detection (see #87) ---
             # tree-sitter-dart does not wrap calls in a single
             # ``call_expression`` node; instead the pattern is
@@ -2136,6 +2215,292 @@ class CodeParser:
                     import_map=import_map, defined_names=defined_names,
                     _depth=_depth + 1,
                 )
+        return True
+
+    @staticmethod
+    def _is_nix_flake_file(file_path: str) -> bool:
+        """Return True for files whose basename is ``flake.nix``."""
+        return Path(file_path).name == "flake.nix"
+
+    def _nix_attrpath_parts(self, attrpath_node) -> list[str]:
+        """Flatten a Nix ``attrpath`` node into a list of identifier parts.
+
+        ``packages.default`` → ``["packages", "default"]``;
+        ``inputs.nixpkgs.url`` → ``["inputs", "nixpkgs", "url"]``. Dotted
+        attrpaths have ``identifier`` children separated by ``.`` tokens.
+        """
+        parts: list[str] = []
+        for child in attrpath_node.children:
+            if child.type == "identifier":
+                parts.append(child.text.decode("utf-8", errors="replace"))
+        return parts
+
+    def _extract_nix_flake_input_urls(
+        self, attrset_node,
+    ) -> list[tuple[str, int]]:
+        """Walk a Nix ``attrset_expression`` looking for ``*.url = "..."``
+        bindings whose RHS is a literal string. Returns ``(url, line)``
+        tuples. Used when the enclosing attrpath is ``inputs`` so that both
+        the nested form
+
+            inputs = { nixpkgs.url = "..."; flake-utils.url = "..."; };
+
+        and the mixed form (an inner input with its own nested attrset)
+        surface the URL strings as IMPORTS_FROM targets.
+        """
+        results: list[tuple[str, int]] = []
+
+        def visit(n) -> None:
+            if n is None:
+                return
+            if n.type == "binding":
+                inner_path = None
+                inner_rhs = None
+                for sub in n.children:
+                    if sub.type == "attrpath":
+                        inner_path = sub
+                    elif sub.type not in ("=", ";") and inner_path is not None:
+                        if inner_rhs is None:
+                            inner_rhs = sub
+                if inner_path is not None and inner_rhs is not None:
+                    parts = self._nix_attrpath_parts(inner_path)
+                    if (
+                        parts
+                        and parts[-1] == "url"
+                        and inner_rhs.type == "string_expression"
+                    ):
+                        for c in inner_rhs.children:
+                            if c.type == "string_fragment":
+                                url = c.text.decode("utf-8", errors="replace")
+                                results.append((url, n.start_point[0] + 1))
+                                break
+                        return  # leaf binding — no children to recurse into
+                    # Non-url binding: still recurse so a deeper url survives
+                    if inner_rhs.type == "attrset_expression":
+                        visit(inner_rhs)
+                        return
+            for c in n.children:
+                visit(c)
+
+        visit(attrset_node)
+        return results
+
+    def _extract_nix_import_targets(self, rhs_node) -> list[tuple[str, int]]:
+        """Walk an expression looking for ``import <path>`` and
+        ``callPackage <path> <args>`` applications. Returns a list of
+        ``(target_path, line)`` tuples for each match.
+
+        Recurses through ``apply_expression`` (so ``import ./x.nix { ... }``
+        and ``pkgs.callPackage ./y.nix { }`` are both caught) and descends
+        into bodies of ``let_expression`` / ``parenthesized_expression`` /
+        ``function_expression`` / ``attrset_expression`` / ``list_expression``
+        so a ``let pkgs = import nixpkgs; in { ... }`` body is scanned too.
+        """
+        results: list[tuple[str, int]] = []
+
+        def head_call_name(apply) -> Optional[str]:
+            """Drill down the left-most side of nested apply_expressions to
+            the callee identifier. ``import ./x`` → ``"import"``;
+            ``pkgs.callPackage ./y { }`` → ``"callPackage"`` (last dotted
+            segment of the select_expression)."""
+            cur = apply
+            while cur is not None and cur.type == "apply_expression":
+                cur = cur.children[0] if cur.children else None
+            if cur is None:
+                return None
+            if cur.type == "variable_expression":
+                for c in cur.children:
+                    if c.type == "identifier":
+                        return c.text.decode("utf-8", errors="replace")
+            if cur.type == "select_expression":
+                # Last identifier in the attrpath portion.
+                last: Optional[str] = None
+                for c in cur.children:
+                    if c.type == "attrpath":
+                        for ac in c.children:
+                            if ac.type == "identifier":
+                                last = ac.text.decode("utf-8", errors="replace")
+                    elif c.type == "identifier":
+                        last = c.text.decode("utf-8", errors="replace")
+                return last
+            if cur.type == "identifier":
+                return cur.text.decode("utf-8", errors="replace")
+            return None
+
+        def first_path_arg(apply) -> Optional[str]:
+            """For nested apply_expressions like ``import ./x.nix { }``, walk
+            down collecting arguments; return the first ``path_expression``
+            we find."""
+            # Descend left spine collecting right-hand args in outer→inner order
+            stack: list = []
+            cur = apply
+            while cur is not None and cur.type == "apply_expression":
+                if len(cur.children) >= 2:
+                    stack.append(cur.children[1])
+                cur = cur.children[0] if cur.children else None
+            # Args closest to the callee come last in stack; try them in
+            # that order (innermost first) so ``import ./x { }`` picks
+            # ``./x`` not ``{ }``.
+            for arg in reversed(stack):
+                if arg.type == "path_expression":
+                    return arg.text.decode("utf-8", errors="replace").strip()
+            return None
+
+        def visit(n) -> None:
+            if n is None:
+                return
+            if n.type == "apply_expression":
+                name = head_call_name(n)
+                if name in ("import", "callPackage"):
+                    path = first_path_arg(n)
+                    if path:
+                        results.append((path, n.start_point[0] + 1))
+                # Still recurse into children so nested imports inside
+                # argument attrsets/lets are caught.
+            for c in n.children:
+                visit(c)
+
+        visit(rhs_node)
+        return results
+
+    def _extract_nix_constructs(
+        self,
+        node,
+        source: bytes,
+        language: str,
+        file_path: str,
+        nodes: list[NodeInfo],
+        edges: list[EdgeInfo],
+        enclosing_class: Optional[str],
+        enclosing_func: Optional[str],
+        import_map: Optional[dict[str, str]],
+        defined_names: Optional[set[str]],
+        _depth: int,
+    ) -> bool:
+        """Handle a Nix ``binding`` node (``attrpath = expr;``).
+
+        - Flattens dotted attrpaths into a single dotted node name
+          (``packages.default``).
+        - In ``flake.nix``, ``inputs.<name>.url = "..."`` bindings emit an
+          ``IMPORTS_FROM`` edge with target = the URL string, and no node.
+        - All other bindings become ``Function`` nodes (matching the
+          Bash/Elixir convention for "the graph's addressable things") with a
+          CONTAINS edge from the File.
+        - The RHS is scanned for ``import <path>`` / ``callPackage <path> ...``
+          applications; each emits an ``IMPORTS_FROM`` edge (relative paths
+          are resolved against the caller's directory when possible).
+        - Recurses into the RHS so nested bindings (e.g. inside
+          ``let ... in { ... }`` or ``outputs = { ... }: { ... }``) are
+          discovered and flattened as their own top-level nodes.
+
+        Returns True (Nix has no other node-type dispatches in the walker).
+        """
+        attrpath_node = None
+        rhs_node = None
+        for sub in node.children:
+            if sub.type == "attrpath":
+                attrpath_node = sub
+            elif sub.type not in ("=", ";") and attrpath_node is not None:
+                # First non-attrpath, non-punctuation child is the RHS.
+                if rhs_node is None:
+                    rhs_node = sub
+        if attrpath_node is None or rhs_node is None:
+            return False
+
+        parts = self._nix_attrpath_parts(attrpath_node)
+        if not parts:
+            return False
+        name = ".".join(parts)
+        line = node.start_point[0] + 1
+
+        # --- Flake input URL: inputs.<name>.url = "..." ------------------
+        # Flat form: ``inputs.nixpkgs.url = "github:...";`` — emit one edge,
+        # skip node creation (this is metadata, not a graph "thing").
+        if (
+            self._is_nix_flake_file(file_path)
+            and len(parts) >= 2
+            and parts[0] == "inputs"
+            and parts[-1] == "url"
+            and rhs_node.type == "string_expression"
+        ):
+            url: Optional[str] = None
+            for c in rhs_node.children:
+                if c.type == "string_fragment":
+                    url = c.text.decode("utf-8", errors="replace")
+                    break
+            if url:
+                edges.append(EdgeInfo(
+                    kind="IMPORTS_FROM",
+                    source=file_path,
+                    target=url,
+                    file_path=file_path,
+                    line=line,
+                ))
+                return True
+
+        # Nested form: ``inputs = { nixpkgs.url = "..."; ... };`` — emit an
+        # edge per inner url string. Still fall through so the ``inputs``
+        # binding itself becomes a Function node and the default recursion
+        # continues (the recursion won't re-emit these urls as separate
+        # Function nodes because the flat form above short-circuits).
+        if (
+            self._is_nix_flake_file(file_path)
+            and parts == ["inputs"]
+            and rhs_node.type == "attrset_expression"
+        ):
+            for url, uline in self._extract_nix_flake_input_urls(rhs_node):
+                edges.append(EdgeInfo(
+                    kind="IMPORTS_FROM",
+                    source=file_path,
+                    target=url,
+                    file_path=file_path,
+                    line=uline,
+                ))
+
+        # --- Regular binding → Function node -----------------------------
+        qualified = self._qualify(name, file_path, enclosing_class)
+        nodes.append(NodeInfo(
+            kind="Function",
+            name=name,
+            file_path=file_path,
+            line_start=line,
+            line_end=node.end_point[0] + 1,
+            language=language,
+            parent_name=enclosing_class,
+        ))
+        container = (
+            self._qualify(enclosing_class, file_path, None)
+            if enclosing_class else file_path
+        )
+        edges.append(EdgeInfo(
+            kind="CONTAINS",
+            source=container,
+            target=qualified,
+            file_path=file_path,
+            line=line,
+        ))
+
+        # --- IMPORTS_FROM edges for import / callPackage inside the RHS --
+        for target, tline in self._extract_nix_import_targets(rhs_node):
+            resolved = self._resolve_module_to_file(target, file_path, "nix")
+            edges.append(EdgeInfo(
+                kind="IMPORTS_FROM",
+                source=file_path,
+                target=resolved if resolved else target,
+                file_path=file_path,
+                line=tline,
+            ))
+
+        # Recurse into the RHS so nested bindings become their own nodes
+        # (e.g. ``outputs = ...: { packages.default = ...; }`` surfaces
+        # ``packages.default`` as a top-level-named Function node too).
+        self._extract_from_tree(
+            rhs_node, source, language, file_path, nodes, edges,
+            enclosing_class=enclosing_class,
+            enclosing_func=enclosing_func,
+            import_map=import_map, defined_names=defined_names,
+            _depth=_depth + 1,
+        )
         return True
 
     def _extract_bash_source_command(
@@ -2731,6 +3096,386 @@ class CodeParser:
         )
         return True
 
+    @staticmethod
+    def _get_java_annotations(class_node) -> list[str]:
+        """Return annotation names from the modifiers child of a Java class/method node."""
+        names: list[str] = []
+        for child in class_node.children:
+            if child.type != "modifiers":
+                continue
+            for mod in child.children:
+                if mod.type in ("marker_annotation", "annotation"):
+                    for sub in mod.children:
+                        if sub.type == "identifier":
+                            names.append(sub.text.decode("utf-8", errors="replace"))
+                            break
+        return names
+
+    def _emit_spring_injections(
+        self,
+        class_node,
+        class_name: str,
+        class_annotations: list[str],
+        language: str,
+        file_path: str,
+        edges: list[EdgeInfo],
+    ) -> None:
+        """Emit INJECTS edges for Spring DI injection points in a Java class.
+
+        Handles three patterns:
+        - @Autowired / @Inject / @Resource field injection
+        - @Autowired constructor injection
+        - Lombok @RequiredArgsConstructor / @AllArgsConstructor with final fields
+        """
+        if language != "java":
+            return
+
+        has_lombok_constructor = any(
+            a in _LOMBOK_CONSTRUCTOR_ANNOTATIONS for a in class_annotations
+        )
+        qualified_source = self._qualify(class_name, file_path, None)
+
+        # Find the class body
+        for node in class_node.children:
+            if node.type != "class_body":
+                continue
+            for member in node.children:
+                if member.type == "field_declaration":
+                    self._emit_spring_field_injection(
+                        member, qualified_source, file_path,
+                        edges, has_lombok_constructor,
+                    )
+                elif member.type == "constructor_declaration":
+                    self._emit_spring_constructor_injection(
+                        member, qualified_source, file_path, edges,
+                    )
+
+    def _emit_spring_field_injection(
+        self,
+        field_node,
+        qualified_source: str,
+        file_path: str,
+        edges: list[EdgeInfo],
+        has_lombok_constructor: bool,
+    ) -> None:
+        """Emit an INJECTS edge for a single field_declaration if injection applies."""
+        field_annotations: list[str] = []
+        has_final = False
+        has_static = False
+        field_type: Optional[str] = None
+        field_name: Optional[str] = None
+
+        for child in field_node.children:
+            if child.type == "modifiers":
+                for mod in child.children:
+                    text = mod.text.decode("utf-8", errors="replace")
+                    if text == "final":
+                        has_final = True
+                    elif text == "static":
+                        has_static = True
+                    elif mod.type in ("marker_annotation", "annotation"):
+                        for sub in mod.children:
+                            if sub.type == "identifier":
+                                field_annotations.append(
+                                    sub.text.decode("utf-8", errors="replace")
+                                )
+                                break
+            elif child.type in ("type_identifier", "generic_type", "array_type"):
+                # Use outermost type name for generic types like List<Foo>
+                if child.type == "type_identifier":
+                    field_type = child.text.decode("utf-8", errors="replace")
+                elif child.type == "generic_type":
+                    for sub in child.children:
+                        if sub.type == "type_identifier":
+                            field_type = sub.text.decode("utf-8", errors="replace")
+                            break
+                elif child.type == "array_type":
+                    for sub in child.children:
+                        if sub.type == "type_identifier":
+                            field_type = sub.text.decode("utf-8", errors="replace")
+                            break
+            elif child.type == "variable_declarator":
+                for sub in child.children:
+                    if sub.type == "identifier":
+                        field_name = sub.text.decode("utf-8", errors="replace")
+                        break
+
+        if not field_type or has_static:
+            return
+
+        has_inject_annotation = any(a in _SPRING_INJECT_ANNOTATIONS for a in field_annotations)
+        is_lombok_injected = has_lombok_constructor and has_final
+
+        if not has_inject_annotation and not is_lombok_injected:
+            return
+
+        injection_type = "field" if has_inject_annotation else "constructor_lombok"
+        extra: dict = {"injection_type": injection_type}
+        if field_name:
+            extra["field_name"] = field_name
+        edges.append(EdgeInfo(
+            kind="INJECTS",
+            source=qualified_source,
+            target=field_type,
+            file_path=file_path,
+            line=field_node.start_point[0] + 1,
+            extra=extra,
+        ))
+
+    def _emit_spring_constructor_injection(
+        self,
+        ctor_node,
+        qualified_source: str,
+        file_path: str,
+        edges: list[EdgeInfo],
+    ) -> None:
+        """Emit INJECTS edges for @Autowired constructor parameters."""
+        ctor_annotations = self._get_java_annotations(ctor_node)
+        if not any(a in _SPRING_INJECT_ANNOTATIONS for a in ctor_annotations):
+            return
+
+        for child in ctor_node.children:
+            if child.type != "formal_parameters":
+                continue
+            for param in child.children:
+                if param.type != "formal_parameter":
+                    continue
+                param_type: Optional[str] = None
+                param_name: Optional[str] = None
+                for sub in param.children:
+                    if sub.type == "type_identifier" and param_type is None:
+                        param_type = sub.text.decode("utf-8", errors="replace")
+                    elif sub.type == "identifier":
+                        param_name = sub.text.decode("utf-8", errors="replace")
+                if param_type:
+                    extra: dict = {"injection_type": "constructor"}
+                    if param_name:
+                        extra["field_name"] = param_name
+                    edges.append(EdgeInfo(
+                        kind="INJECTS",
+                        source=qualified_source,
+                        target=param_type,
+                        file_path=file_path,
+                        line=param.start_point[0] + 1,
+                        extra=extra,
+                    ))
+
+    def _emit_temporal_stub_fields(
+        self,
+        class_node,
+        class_name: str,
+        file_path: str,
+        edges: list[EdgeInfo],
+    ) -> None:
+        """Emit TEMPORAL_STUB edges for Temporal activity/workflow stub fields.
+
+        Detects fields whose type name ends with 'Activity' or 'Workflow' —
+        the universal naming convention for Temporal interfaces. The temporal
+        resolver validates these against nodes that have temporal_role in extra.
+        Static fields are skipped (e.g. logger, constants).
+        """
+        qualified_source = self._qualify(class_name, file_path, None)
+
+        for node in class_node.children:
+            if node.type != "class_body":
+                continue
+            for member in node.children:
+                if member.type != "field_declaration":
+                    continue
+                has_static = False
+                field_type: Optional[str] = None
+                field_name: Optional[str] = None
+
+                for ch in member.children:
+                    if ch.type == "modifiers":
+                        for mod in ch.children:
+                            if mod.text and mod.text.decode("utf-8", errors="replace") == "static":
+                                has_static = True
+                    elif ch.type == "type_identifier":
+                        field_type = ch.text.decode("utf-8", errors="replace")
+                    elif ch.type == "variable_declarator":
+                        for sub in ch.children:
+                            if sub.type == "identifier":
+                                field_name = sub.text.decode("utf-8", errors="replace")
+                                break
+
+                if has_static or not field_type or not field_name:
+                    continue
+
+                # Only emit for types following the Temporal naming convention
+                if not (field_type.endswith("Activity") or field_type.endswith("Workflow")):
+                    continue
+
+                edges.append(EdgeInfo(
+                    kind="TEMPORAL_STUB",
+                    source=qualified_source,
+                    target=field_type,
+                    file_path=file_path,
+                    line=member.start_point[0] + 1,
+                    extra={"field_name": field_name, "stub_type": (
+                        "activity" if field_type.endswith("Activity") else "workflow"
+                    )},
+                ))
+
+    @staticmethod
+    def _get_kafka_annotation_topics(annotation_node) -> list[str]:
+        """Extract topic strings from @KafkaListener(topics = "...") or topics = {"a","b"}."""
+        topics: list[str] = []
+        for child in annotation_node.children:
+            if child.type != "annotation_argument_list":
+                continue
+            for pair in child.children:
+                if pair.type != "element_value_pair":
+                    continue
+                key_node = next((c for c in pair.children if c.type == "identifier"), None)
+                if key_node is None:
+                    continue
+                key = key_node.text.decode("utf-8", errors="replace")
+                if key not in ("topics", "topicPattern", "value"):
+                    continue
+                # value can be string_literal or element_value_array_initializer
+                for val in pair.children:
+                    if val.type == "string_literal":
+                        raw = val.text.decode("utf-8", errors="replace").strip('"').strip("'")
+                        if raw:
+                            topics.append(raw)
+                    elif val.type in ("array_initializer", "element_value_array_initializer"):
+                        for item in val.children:
+                            if item.type == "string_literal":
+                                raw = item.text.decode("utf-8", errors="replace").strip('"').strip("'")
+                                if raw:
+                                    topics.append(raw)
+        return topics
+
+    def _emit_kafka_edges_from_class(
+        self,
+        class_node,
+        class_name: str,
+        file_path: str,
+        edges: list[EdgeInfo],
+    ) -> None:
+        """Emit CONSUMES/PRODUCES edges for Kafka field declarations.
+
+        Handles:
+        - KafkaReceiver / ReactiveKafkaConsumerTemplate → CONSUMES
+        - KafkaTemplate / KafkaOperations / ReactiveKafkaProducerTemplate → PRODUCES
+        Generic value type (e.g. KafkaReceiver<String, EquipmentMove>) is
+        stored in extra.message_type for traceability.
+        """
+        qualified_source = self._qualify(class_name, file_path, None)
+
+        for node in class_node.children:
+            if node.type != "class_body":
+                continue
+            for member in node.children:
+                if member.type != "field_declaration":
+                    continue
+                has_static = False
+                outer_type: Optional[str] = None
+                value_type: Optional[str] = None   # second generic param
+                field_name: Optional[str] = None
+
+                for ch in member.children:
+                    if ch.type == "modifiers":
+                        for mod in ch.children:
+                            if mod.text and mod.text.decode("utf-8", errors="replace") == "static":
+                                has_static = True
+                    elif ch.type == "type_identifier":
+                        outer_type = ch.text.decode("utf-8", errors="replace")
+                    elif ch.type == "generic_type":
+                        # KafkaReceiver<String, EquipmentMove>
+                        type_args: list[str] = []
+                        for sub in ch.children:
+                            if sub.type == "type_identifier":
+                                if outer_type is None:
+                                    outer_type = sub.text.decode("utf-8", errors="replace")
+                            elif sub.type == "type_arguments":
+                                for arg in sub.children:
+                                    if arg.type == "type_identifier":
+                                        type_args.append(arg.text.decode("utf-8", errors="replace"))
+                        if len(type_args) >= 2:
+                            value_type = type_args[-1]  # last param is the value/message type
+                    elif ch.type == "variable_declarator":
+                        for sub in ch.children:
+                            if sub.type == "identifier":
+                                field_name = sub.text.decode("utf-8", errors="replace")
+                                break
+
+                if has_static or not outer_type or not field_name:
+                    continue
+
+                extra: dict = {"field_name": field_name}
+                if value_type:
+                    extra["message_type"] = value_type
+
+                if outer_type in _KAFKA_CONSUMER_TYPES:
+                    extra["kafka_type"] = outer_type
+                    edges.append(EdgeInfo(
+                        kind="CONSUMES",
+                        source=qualified_source,
+                        target=f"kafka:config",
+                        file_path=file_path,
+                        line=member.start_point[0] + 1,
+                        extra=extra,
+                    ))
+                elif outer_type in _KAFKA_PRODUCER_TYPES:
+                    extra["kafka_type"] = outer_type
+                    edges.append(EdgeInfo(
+                        kind="PRODUCES",
+                        source=qualified_source,
+                        target=f"kafka:config",
+                        file_path=file_path,
+                        line=member.start_point[0] + 1,
+                        extra=extra,
+                    ))
+
+    def _emit_kafka_edges_from_method(
+        self,
+        method_node,
+        method_name: str,
+        class_name: Optional[str],
+        file_path: str,
+        edges: list[EdgeInfo],
+    ) -> None:
+        """Emit CONSUMES edges for @KafkaListener / @KafkaHandler annotated methods."""
+        qualified_source = self._qualify(method_name, file_path, class_name)
+
+        for child in method_node.children:
+            if child.type != "modifiers":
+                continue
+            for mod in child.children:
+                if mod.type not in ("annotation", "marker_annotation"):
+                    continue
+                ann_name: Optional[str] = None
+                for sub in mod.children:
+                    if sub.type == "identifier":
+                        ann_name = sub.text.decode("utf-8", errors="replace")
+                        break
+                if ann_name not in _KAFKA_LISTENER_ANNOTATIONS:
+                    continue
+                # Extract topics from annotation arguments
+                topics = self._get_kafka_annotation_topics(mod)
+                if topics:
+                    for topic in topics:
+                        edges.append(EdgeInfo(
+                            kind="CONSUMES",
+                            source=qualified_source,
+                            target=f"kafka:{topic}",
+                            file_path=file_path,
+                            line=method_node.start_point[0] + 1,
+                            extra={"topic": topic, "kafka_type": "KafkaListener"},
+                        ))
+                else:
+                    # @KafkaListener without resolvable topic (config placeholder)
+                    edges.append(EdgeInfo(
+                        kind="CONSUMES",
+                        source=qualified_source,
+                        target="kafka:config",
+                        file_path=file_path,
+                        line=method_node.start_point[0] + 1,
+                        extra={"kafka_type": ann_name},
+                    ))
+
     def _extract_classes(
         self,
         child,
@@ -2768,6 +3513,24 @@ class CodeParser:
             elif child.type == "protocol_declaration":
                 extra["swift_kind"] = "protocol"
 
+        # Java: detect Spring stereotype annotations and store as metadata
+        class_annotations: list[str] = []
+        if language == "java":
+            class_annotations = self._get_java_annotations(child)
+            spring_stereotypes = [
+                a for a in class_annotations if a in _SPRING_STEREOTYPE_ANNOTATIONS
+            ]
+            if spring_stereotypes:
+                extra["spring_stereotype"] = spring_stereotypes[0]
+            if class_annotations:
+                extra["spring_annotations"] = class_annotations
+            temporal_roles = [
+                a for a in class_annotations if a in _TEMPORAL_INTERFACE_ANNOTATIONS
+            ]
+            if temporal_roles:
+                role = "workflow_interface" if "WorkflowInterface" in temporal_roles else "activity_interface"
+                extra["temporal_role"] = role
+
         node = NodeInfo(
             kind="Class",
             name=name,
@@ -2801,6 +3564,16 @@ class CodeParser:
                 file_path=file_path,
                 line=child.start_point[0] + 1,
             ))
+
+        # Spring DI: emit INJECTS edges for injected dependencies
+        if language == "java":
+            self._emit_spring_injections(
+                child, name, class_annotations, language, file_path, edges,
+            )
+            # Temporal: emit TEMPORAL_STUB edges for activity/workflow stub fields
+            self._emit_temporal_stub_fields(child, name, file_path, edges)
+            # Kafka: emit CONSUMES/PRODUCES edges for Kafka field declarations
+            self._emit_kafka_edges_from_class(child, name, file_path, edges)
 
         # Recurse into class body
         self._extract_from_tree(
@@ -2870,6 +3643,20 @@ class CodeParser:
         params = self._get_params(child, language, source)
         ret_type = self._get_return_type(child, language, source)
 
+        # Java: detect Temporal method-level annotations and Kafka listeners
+        method_extra: dict = {}
+        if language == "java" and deco_list:
+            temporal_method_annots = [
+                a for a in deco_list if a in _TEMPORAL_METHOD_ANNOTATIONS
+            ]
+            if temporal_method_annots:
+                method_extra["temporal_role"] = temporal_method_annots[0].lower()
+            if any(a.split("(")[0] in _KAFKA_LISTENER_ANNOTATIONS for a in deco_list):
+                method_extra["kafka_listener"] = True
+                self._emit_kafka_edges_from_method(
+                    child, name, enclosing_class, file_path, edges,
+                )
+
         node = NodeInfo(
             kind=kind,
             name=name,
@@ -2881,6 +3668,7 @@ class CodeParser:
             params=params,
             return_type=ret_type,
             is_test=is_test,
+            extra=method_extra,
         )
         nodes.append(node)
 
@@ -3051,21 +3839,80 @@ class CodeParser:
                     enclosing_class, file_path, None
                 )
             if caller:
-                target = self._resolve_call_target(
-                    call_name, file_path, language,
-                    import_map or {}, defined_names or set(),
-                )
+                # Java method_invocation: extract actual method name and receiver
+                # separately so the Spring DI resolver can rewrite the target.
+                call_extra: dict = {}
+                if language == "java" and child.type == "method_invocation":
+                    method_name, receiver = self._get_java_method_and_receiver(child)
+                    if method_name:
+                        call_name = method_name
+                    if receiver:
+                        call_extra["receiver"] = receiver
+
+                # When a receiver is present, skip scope-based resolution: the method
+                # lives on the receiver's type, not in the current file's scope.
+                # The spring_resolver post-pass will do the correct cross-type lookup.
+                if call_extra.get("receiver"):
+                    target = call_name
+                else:
+                    target = self._resolve_call_target(
+                        call_name, file_path, language,
+                        import_map or {}, defined_names or set(),
+                    )
                 edges.append(EdgeInfo(
                     kind="CALLS",
                     source=caller,
                     target=target,
                     file_path=file_path,
                     line=child.start_point[0] + 1,
+                    extra=call_extra,
                 ))
                 if language == "verilog" and child.type == "module_instantiation":
                     self._verilog_emit_connects(child, caller, target, file_path, edges)
 
         return False
+
+    @staticmethod
+    def _get_java_method_and_receiver(node) -> tuple[Optional[str], Optional[str]]:
+        """For a Java method_invocation node, return (method_name, receiver_name).
+
+        Pattern: [receiver_identifier, '.', method_identifier, argument_list]
+        Chained: [inner_method_invocation, '.', method_identifier, argument_list]
+
+        Returns (None, None) for unrecognised shapes.
+        """
+        children = node.children
+        if len(children) < 3:
+            return None, None
+
+        # method_identifier is always the last identifier before argument_list
+        method_name: Optional[str] = None
+        receiver_name: Optional[str] = None
+
+        # Scan backwards for the method identifier
+        for i in range(len(children) - 1, -1, -1):
+            ch = children[i]
+            if ch.type == "argument_list":
+                continue
+            if ch.type == "identifier":
+                if method_name is None:
+                    method_name = ch.text.decode("utf-8", errors="replace")
+                else:
+                    # Second identifier scanning backwards = receiver
+                    receiver_name = ch.text.decode("utf-8", errors="replace")
+                break
+            if ch.type == "." :
+                continue
+            # Chained call or complex expression as receiver — no simple receiver
+            break
+
+        # Receiver is the first child if it's a plain identifier
+        if method_name and children[0].type == "identifier":
+            first_text = children[0].text.decode("utf-8", errors="replace")
+            if first_text != method_name:
+                receiver_name = first_text
+
+        return method_name, receiver_name
 
     def _extract_jsx_component_call(
         self,
@@ -3141,6 +3988,11 @@ class CodeParser:
     # AST node types for array/list containers.
     _ARRAY_TYPES = frozenset({"array", "list"})
 
+    # AST node types for call argument containers. JS/TS uses ``arguments``;
+    # Python uses ``argument_list``. Both share the same identifier-child shape
+    # for bare-identifier callbacks like ``executor.submit(my_handler)``.
+    _ARGUMENTS_TYPES = frozenset({"arguments", "argument_list"})
+
     # Names that are almost certainly not function references (constants,
     # common primitives).  All-uppercase identifiers and very short names
     # are excluded by a length/casing heuristic in the method itself.
@@ -3213,7 +4065,7 @@ class CodeParser:
             return
 
         # --- Callback arguments (identifier args inside call_expression) ---
-        if node_type == "arguments":
+        if node_type in self._ARGUMENTS_TYPES:
             self._ref_from_arguments(
                 child, source, language, file_path, caller, edges, imap, dnames,
             )
@@ -3711,6 +4563,18 @@ class CodeParser:
                 pass
             return None
 
+        if language == "nix":
+            # ``import ./x.nix`` / ``callPackage ./x.nix { }`` — relative to
+            # the caller's directory. Non-relative targets (URLs, bare
+            # identifiers like ``nixpkgs``) are left unresolved.
+            try:
+                target = (caller_dir / module).resolve()
+                if target.is_file():
+                    return str(target)
+            except (OSError, ValueError):
+                pass
+            return None
+
         if language == "python":
             rel_path = module.replace(".", "/")
             candidates = [rel_path + ".py", rel_path + "/__init__.py"]
@@ -3997,12 +4861,30 @@ class CodeParser:
                     return child.text.decode("utf-8", errors="replace")
                 if child.type == "package" and child.text != b"package":
                     return child.text.decode("utf-8", errors="replace")
+        # Java: method_declaration has return type_identifier before the method
+        # identifier — skip straight to the first plain identifier child to
+        # avoid returning the return type as the function name.
+        if language == "java" and kind == "function" and node.type in (
+            "method_declaration", "constructor_declaration",
+        ):
+            for child in node.children:
+                if child.type == "identifier":
+                    return child.text.decode("utf-8", errors="replace")
+            return None
+
         # For C/C++/Objective-C: function names are inside
         # function_declarator / pointer_declarator. Check these first to
         # avoid matching the return type_identifier as the function name.
         if language in ("c", "cpp", "objc") and kind == "function":
             for child in node.children:
                 if child.type in ("function_declarator", "pointer_declarator"):
+                    # Scoped names like Foo::bar use qualified_identifier; take
+                    # the rightmost identifier/field_identifier after the last ::.
+                    for sub in child.children:
+                        if sub.type == "qualified_identifier":
+                            for qsub in reversed(sub.children):
+                                if qsub.type in ("identifier", "field_identifier"):
+                                    return qsub.text.decode("utf-8", errors="replace")
                     result = self._get_name(child, language, kind)
                     if result:
                         return result
@@ -4073,11 +4955,13 @@ class CodeParser:
                         for sub in child.children:
                             if sub.type == "function_identifier":
                                 return sub.text.decode("utf-8", errors="replace")
-        # Most languages use a 'name' child
+        # Most languages use a 'name' child.
+        # field_identifier covers C++ class member function names inside
+        # function_declarator (e.g. virtual std::string get_name() = 0).
         for child in node.children:
             if child.type in (
                 "identifier", "name", "type_identifier", "property_identifier",
-                "simple_identifier", "constant",
+                "simple_identifier", "constant", "field_identifier",
             ):
                 return child.text.decode("utf-8", errors="replace")
         # For Go type declarations, look for type_spec
